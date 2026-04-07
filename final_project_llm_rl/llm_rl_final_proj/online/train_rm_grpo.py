@@ -211,8 +211,18 @@ def _compute_group_advantages(
     # TODO(student): compute one scalar advantage per sampled completion by grouping rewards
     # into prompt-wise batches of size `group_size`, subtracting the group mean, and optionally
     # dividing by the group standard deviation when `divide_by_std=True`.
-    raise NotImplementedError("Implement _compute_group_advantages in the student starter.")
+    grouped_rewards = rewards.view(-1, group_size)
 
+    group_means = grouped_rewards.mean(dim=1, keepdim=True)
+
+    advantages = grouped_rewards - group_means
+
+    if divide_by_std:
+        group_stds = grouped_rewards.std(dim=1, keepdim=True, unbiased=False)
+        advantages = advantages / (group_stds + eps)
+
+    return advantages.view(-1)
+    # raise NotImplementedError("Implement _compute_group_advantages in the student starter.")
 
 def _build_online_algo(cfg: OnlineRMGRPOConfig):
     algo_cfg = AlgoConfig(
@@ -237,7 +247,13 @@ def _build_online_algo(cfg: OnlineRMGRPOConfig):
 def _algo_divides_advantages_by_std(algo: str) -> bool:
     # TODO(student): return True for the algorithms that use group-standard-deviation
     # normalization and False for the algorithms that intentionally avoid it.
-    raise NotImplementedError("Implement _algo_divides_advantages_by_std in the student starter.")
+    if algo == "grpo":
+        return True
+    if algo == "dr_grpo":
+        return True
+    if algo == "gspo":
+        return False
+    # raise NotImplementedError("Implement _algo_divides_advantages_by_std in the student starter.")
 
 
 def _normalize_completion_for_reward_scoring(text: str) -> str:
