@@ -21,13 +21,12 @@ class GSPO(RLAlgorithm):
         rollout: RolloutBatch,
         grad_accum_steps: int = 1,
     ) -> Dict[str, float]:
-        del model, optimizer, rollout, grad_accum_steps
         # TODO(student): implement GSPO.
         # The main change relative to GRPO is that you should aggregate token log-ratios into
         # one sequence-level ratio before applying PPO-style clipping.
 
         accum = 0
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
         total_loss = 0.0
         total_kl = 0.0
@@ -57,10 +56,10 @@ class GSPO(RLAlgorithm):
                 )
         #   4. form PPO ratios against mb.old_logprobs,
                 log_ratios = new_logprobs - mb.old_logprobs
-                log_ratios_sum = masked_mean_per_row(log_ratios, mb.completion_mask)
-                ratios = torch.exp(log_ratios_sum)
-        #   5. apply token-level clipping with the sequence-level GRPO averaging used in this codebase,
-                clipped_ratios = torch.clamp(ratios, 1 - self.cfg.clip_eps, 1 + self.cfg.clip_eps)
+                seq_log_ratio = masked_mean_per_row(log_ratios, mb.completion_mask) 
+                ratios = torch.exp(seq_log_ratio)
+
+                clipped_ratios = torch.clamp(ratios, 1 - self.cfg.clip_eps, 1 + self.cfg.clip_eps)  # [N]
         #   6. add KL regularization against mb.ref_logprobs,
                 kl_divergence = approx_kl_from_logprobs(
                     new_logprobs=new_logprobs,
@@ -68,10 +67,10 @@ class GSPO(RLAlgorithm):
                     mask=mb.completion_mask,
                 )
         #   7. handle gradient accumulation / clipping / optimizer steps,
-                surr1 = ratios * mb.advantages.unsqueeze(-1)
-                surr2 = clipped_ratios * mb.advantages.unsqueeze(-1)
-                surr = torch.min(surr1, surr2)
-                pg_loss = -masked_mean_per_row(surr, mb.completion_mask).mean()
+                surr1 = ratios * mb.advantages 
+                surr2 = clipped_ratios * mb.advantages
+                surr = torch.minimum(surr1, surr2) 
+                pg_loss = -surr.mean()
                 loss = (pg_loss + self.cfg.kl_coef * kl_divergence) / grad_accum_steps 
 
                 if float(mb.completion_mask.sum().item()) == 0:
@@ -85,17 +84,24 @@ class GSPO(RLAlgorithm):
                 accum += 1
                 total_loss += loss.item()
                 total_kl += kl_divergence.mean().item()
-                total_entropy += (-new_logprobs * torch.exp(new_logprobs) * mb.completion_mask).sum().item() / mb.completion_mask.sum().item()
+                total_entropy += (-masked_mean_per_row(new_logprobs, mb.completion_mask)).mean().item()
                 n_mb += 1
 
                 if accum % grad_accum_steps == 0:
                     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), self.cfg.max_grad_norm)
                     total_grad_norm += grad_norm.item()
                     optimizer.step()
-                    optimizer.zero_grad()
+                    optimizer.zero_grad(set_to_none=True)
                     opt_steps += 1
                     accum = 0
         #   8. return the logged metrics expected by the training script.
+        if accum > 0:
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), self.cfg.max_grad_norm)
+            total_grad_norm += float(grad_norm.item())
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            opt_steps += 1
+
         denom = max(1, n_mb)
         return {
             "train/policy_loss_with_kl_penalty_mean_over_minibatches": total_loss / denom,

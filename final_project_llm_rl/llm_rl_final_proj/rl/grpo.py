@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from typing import Dict
 
-from final_project_llm_rl.llm_rl_final_proj.models.logprobs import approx_kl_from_logprobs, compute_per_token_logprobs, masked_mean_per_row
 import torch
 
 from llm_rl_final_proj.rl.base import RLAlgorithm
 from llm_rl_final_proj.rollout.rollout_buffer import RolloutBatch, iter_minibatches
+from llm_rl_final_proj.models.logprobs import (approx_kl_from_logprobs,compute_per_token_logprobs, masked_mean_per_row,)
 
 
 class GRPO(RLAlgorithm):
@@ -24,7 +24,7 @@ class GRPO(RLAlgorithm):
         # TODO(student): implement one GRPO training iteration.
 
         accum = 0
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
         total_loss = 0.0
         total_kl = 0.0
@@ -80,17 +80,24 @@ class GRPO(RLAlgorithm):
                 accum += 1
                 total_loss += loss.item()
                 total_kl += kl_divergence.mean().item()
-                total_entropy += (-new_logprobs * torch.exp(new_logprobs) * mb.completion_mask).sum().item() / mb.completion_mask.sum().item()
+                total_entropy += (-masked_mean_per_row(new_logprobs, mb.completion_mask)).mean().item()
                 n_mb += 1
 
                 if accum % grad_accum_steps == 0:
                     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), self.cfg.max_grad_norm)
                     total_grad_norm += grad_norm.item()
                     optimizer.step()
-                    optimizer.zero_grad()
+                    optimizer.zero_grad(set_to_none=True)
                     opt_steps += 1
                     accum = 0
         #   8. return the logged metrics expected by the training script.
+        if accum > 0:
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), self.cfg.max_grad_norm)
+            total_grad_norm += float(grad_norm.item())
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            opt_steps += 1
+
         denom = max(1, n_mb)
         return {
             "train/policy_loss_with_kl_penalty_mean_over_minibatches": total_loss / denom,
