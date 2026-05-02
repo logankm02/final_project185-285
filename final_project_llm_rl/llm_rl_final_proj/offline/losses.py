@@ -128,6 +128,33 @@ def compute_offline_preference_loss(
                 "preference/aot_quantile_accuracy": float((quantile_gap.detach() > 0).float().mean().item()),
             }
         )
+    elif algo == "aot_weighted":
+        if reference_scores is None:
+            raise ValueError("aot_weighted requires reference scores.")
+        chosen_rewards = beta * (policy_scores.chosen_logp_sum - reference_scores.chosen_logp_sum)
+        rejected_rewards = beta * (policy_scores.rejected_logp_sum - reference_scores.rejected_logp_sum)
+        chosen_sort_idx = chosen_rewards.argsort(dim=0)
+        rejected_sort_idx = rejected_rewards.argsort(dim=0)
+        chosen_sorted = chosen_rewards[chosen_sort_idx]
+        rejected_sorted = rejected_rewards[rejected_sort_idx]
+        chosen_probs = policy_scores.chosen_logp_mean.exp()[chosen_sort_idx]
+        rejected_probs = policy_scores.rejected_logp_mean.exp()[rejected_sort_idx]
+        q_weights = (chosen_probs + rejected_probs) / 2
+        q_weights = (q_weights / q_weights.clamp_min(1e-8).sum()).detach()
+        quantile_gap = chosen_sorted - rejected_sorted
+        base_losses = -F.logsigmoid(quantile_gap)
+        # fold weights in so losses.mean() == weighted sum (q_weights sums to 1)
+        losses = base_losses * q_weights * len(q_weights)
+        metrics.update(
+            {
+                "preference/aot_chosen_reward_mean": float(chosen_rewards.detach().mean().item()),
+                "preference/aot_rejected_reward_mean": float(rejected_rewards.detach().mean().item()),
+                "preference/aot_quantile_gap_mean": float(quantile_gap.detach().mean().item()),
+                "preference/aot_quantile_accuracy": float((quantile_gap.detach() > 0).float().mean().item()),
+                "preference/aot_q_weight_max": float(q_weights.detach().max().item()),
+                "preference/aot_q_weight_min": float(q_weights.detach().min().item()),
+            }
+        )
     else:
         raise ValueError(
             f"Unknown offline preference algo: {algo}. "
