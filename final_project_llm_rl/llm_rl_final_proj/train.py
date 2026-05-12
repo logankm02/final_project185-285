@@ -58,6 +58,8 @@ def parse_args() -> TrainConfig:
             "ipo",
             "aot",
             "aot_weighted",
+            "apo_zero",
+            "apo_down",
         ],
     )
     ap.add_argument("--num_train_epochs", type=float, default=TrainConfig.num_train_epochs)
@@ -281,7 +283,7 @@ def main() -> None:
         step=0,
     )
 
-    need_reference = cfg.algo in {"dpo", "ipo", "aot", "aot_weighted"}
+    need_reference = cfg.algo in {"dpo", "ipo", "aot", "aot_weighted", "apo_zero", "apo_down"}
 
     def run_eval(step: int, phase: str) -> Dict[str, float]:
         model.eval()

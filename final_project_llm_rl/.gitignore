@@ -19,3 +19,4 @@ wandb/
 *.parquet
 *.arrow
 
+.DS_Store

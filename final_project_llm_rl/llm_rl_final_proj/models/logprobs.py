@@ -80,7 +80,7 @@ def approx_kl_from_logprobs(
     """
     # TODO(student): implement the sampled-token KL proxy used throughout the codebase.
     # You should mask out non-completion positions and return a scalar batch mean.
-    delta = ref_logprobs - new_logprobs
+    delta = (ref_logprobs - new_logprobs).nan_to_num(0.0)
     if log_ratio_clip is not None:
         delta = delta.clamp(min=-float(log_ratio_clip), max=float(log_ratio_clip))
 

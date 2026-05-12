@@ -131,8 +131,8 @@ def compute_offline_preference_loss(
     elif algo == "aot_weighted":
         if reference_scores is None:
             raise ValueError("aot_weighted requires reference scores.")
-        chosen_rewards = beta * (policy_scores.chosen_logp_sum - reference_scores.chosen_logp_sum)
-        rejected_rewards = beta * (policy_scores.rejected_logp_sum - reference_scores.rejected_logp_sum)
+        chosen_rewards = beta * (policy_scores.chosen_logp_mean - reference_scores.chosen_logp_mean)
+        rejected_rewards = beta * (policy_scores.rejected_logp_mean - reference_scores.rejected_logp_mean)
         chosen_sort_idx = chosen_rewards.argsort(dim=0)
         rejected_sort_idx = rejected_rewards.argsort(dim=0)
         chosen_sorted = chosen_rewards[chosen_sort_idx]
@@ -143,7 +143,6 @@ def compute_offline_preference_loss(
         q_weights = (q_weights / q_weights.clamp_min(1e-8).sum()).detach()
         quantile_gap = chosen_sorted - rejected_sorted
         base_losses = -F.logsigmoid(quantile_gap)
-        # fold weights in so losses.mean() == weighted sum (q_weights sums to 1)
         losses = base_losses * q_weights * len(q_weights)
         metrics.update(
             {
@@ -153,6 +152,36 @@ def compute_offline_preference_loss(
                 "preference/aot_quantile_accuracy": float((quantile_gap.detach() > 0).float().mean().item()),
                 "preference/aot_q_weight_max": float(q_weights.detach().max().item()),
                 "preference/aot_q_weight_min": float(q_weights.detach().min().item()),
+            }
+        )
+    elif algo == "apo_down":
+        if reference_scores is None:
+            raise ValueError("APO-down requires reference scores.")
+        chosen_rewards = beta * (policy_scores.chosen_logp_sum - reference_scores.chosen_logp_sum)
+        rejected_rewards = beta * (policy_scores.rejected_logp_sum - reference_scores.rejected_logp_sum)
+        margin = chosen_rewards - rejected_rewards
+        losses = -F.logsigmoid(margin) - F.logsigmoid(-rejected_rewards)
+        metrics.update(
+            {
+                "preference/apo_chosen_reward_mean": float(chosen_rewards.detach().mean().item()),
+                "preference/apo_rejected_reward_mean": float(rejected_rewards.detach().mean().item()),
+                "preference/apo_chosen_positive_frac": float((chosen_rewards.detach() > 0).float().mean().item()),
+                "preference/apo_rejected_negative_frac": float((rejected_rewards.detach() < 0).float().mean().item()),
+                "preference/apo_margin_mean": float(margin.detach().mean().item()),
+            }
+        )
+    elif algo == "apo_zero":
+        if reference_scores is None:
+            raise ValueError("APO-zero requires reference scores.")
+        chosen_rewards = beta * (policy_scores.chosen_logp_sum - reference_scores.chosen_logp_sum)
+        rejected_rewards = beta * (policy_scores.rejected_logp_sum - reference_scores.rejected_logp_sum)
+        losses = -F.logsigmoid(chosen_rewards) + F.logsigmoid(rejected_rewards)
+        metrics.update(
+            {
+                "preference/apo_chosen_reward_mean": float(chosen_rewards.detach().mean().item()),
+                "preference/apo_rejected_reward_mean": float(rejected_rewards.detach().mean().item()),
+                "preference/apo_chosen_positive_frac": float((chosen_rewards.detach() > 0).float().mean().item()),
+                "preference/apo_rejected_negative_frac": float((rejected_rewards.detach() < 0).float().mean().item()),
             }
         )
     else:
