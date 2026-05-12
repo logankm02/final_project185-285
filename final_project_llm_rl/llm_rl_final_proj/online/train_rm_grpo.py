@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
-import torch
+import torch  # pyright: ignore[reportMissingImports]
 
 from llm_rl_final_proj.data.ultrafeedback import GenerationExample, build_generation_examples, dataset_overview
 from llm_rl_final_proj.models.load import (
@@ -97,6 +97,7 @@ class OnlineRMGRPOConfig:
     wandb_project: str = "llm-rl-final-project"
     wandb_name: str = "rm_grpo"
     wandb_enabled: bool = True
+    log_interval: int = 1
     sample_log_n: int = 8
     sample_log_max_chars: int = 2500
 
@@ -107,7 +108,7 @@ def parse_args() -> OnlineRMGRPOConfig:
         "--algo",
         type=str,
         default=OnlineRMGRPOConfig.algo,
-        choices=["grpo", "dr_grpo", "gspo"],
+        choices=["grpo", "dr_grpo", "gspo", "reinforce"],
     )
     ap.add_argument("--model_name", type=str, default=OnlineRMGRPOConfig.model_name)
     ap.add_argument("--reward_model_name", type=str, default=OnlineRMGRPOConfig.reward_model_name)
@@ -175,6 +176,12 @@ def parse_args() -> OnlineRMGRPOConfig:
         action=argparse.BooleanOptionalAction,
         default=OnlineRMGRPOConfig.wandb_enabled,
     )
+    ap.add_argument(
+        "--log_interval",
+        type=int,
+        default=OnlineRMGRPOConfig.log_interval,
+        help="Log scalar training metrics to W&B every N steps (1 = every step).",
+    )
     ap.add_argument("--sample_log_n", type=int, default=OnlineRMGRPOConfig.sample_log_n)
     ap.add_argument("--sample_log_max_chars", type=int, default=OnlineRMGRPOConfig.sample_log_max_chars)
     args = ap.parse_args()
@@ -239,6 +246,8 @@ def _build_online_algo(cfg: OnlineRMGRPOConfig):
         return DrGRPO(algo_cfg)
     if cfg.algo == "gspo":
         return GSPO(algo_cfg)
+    if cfg.algo == "reinforce":
+        return Reinforce(algo_cfg)
     raise ValueError(f"Unsupported --algo {cfg.algo}")
 
 
@@ -250,6 +259,8 @@ def _algo_divides_advantages_by_std(algo: str) -> bool:
         return True
     if algo in {"dr_grpo", "drgrpo"}:
         return False
+    if algo in {"reinforce"}:
+        return True
     raise ValueError(f"Unknown algo for std-normalization rule: {algo}")
 
 
@@ -608,7 +619,8 @@ def main() -> None:
             **train_metrics,
             **get_cuda_memory_metrics(prefix="train"),
         }
-        logger.log(log_metrics, step=step)
+        if (cfg.log_interval <= 1) or (step % cfg.log_interval == 0) or (step == cfg.steps):
+            logger.log(log_metrics, step=step)
 
         should_eval = (step % cfg.eval_interval == 0) or (step == cfg.steps)
         should_save = (step % cfg.save_interval == 0) or (step == cfg.steps)

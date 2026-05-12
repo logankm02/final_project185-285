@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
-import torch
+import torch  # pyright: ignore[reportMissingImports]
 
 from llm_rl_final_proj.data.ultrafeedback import GenerationExample, build_generation_examples, dataset_overview
 from llm_rl_final_proj.models.load import load_lora_policy_model_and_tokenizer, load_reward_model_and_tokenizer
@@ -70,6 +70,11 @@ class OnlineRMPPOConfig:
     vf_coef: float = 0.5
     ent_coef: float = 0.0
     kl_coef: float = 0.01
+    adaptive_kl: bool = True
+    target_kl: float = 0.1
+    kl_horizon: float = 10.0
+    kl_coef_min: float = 1e-4
+    kl_coef_max: float = 1.0
     adv_clip: float = 5.0
     normalize_advantages: bool = True
 
@@ -96,6 +101,7 @@ class OnlineRMPPOConfig:
     wandb_project: str = "llm-rl-final-project"
     wandb_name: str = "rm_ppo"
     wandb_enabled: bool = True
+    log_interval: int = 1
     sample_log_n: int = 8
     sample_log_max_chars: int = 2500
 
@@ -138,6 +144,21 @@ def parse_args() -> OnlineRMPPOConfig:
     ap.add_argument("--vf_coef", type=float, default=OnlineRMPPOConfig.vf_coef)
     ap.add_argument("--ent_coef", type=float, default=OnlineRMPPOConfig.ent_coef)
     ap.add_argument("--kl_coef", type=float, default=OnlineRMPPOConfig.kl_coef)
+    ap.add_argument(
+        "--adaptive_kl",
+        action=argparse.BooleanOptionalAction,
+        default=OnlineRMPPOConfig.adaptive_kl,
+        help="If true, adapt kl_coef to track target_kl.",
+    )
+    ap.add_argument("--target_kl", type=float, default=OnlineRMPPOConfig.target_kl)
+    ap.add_argument(
+        "--kl_horizon",
+        type=float,
+        default=OnlineRMPPOConfig.kl_horizon,
+        help="Larger -> slower kl_coef adaptation. Typical range ~5-50.",
+    )
+    ap.add_argument("--kl_coef_min", type=float, default=OnlineRMPPOConfig.kl_coef_min)
+    ap.add_argument("--kl_coef_max", type=float, default=OnlineRMPPOConfig.kl_coef_max)
     ap.add_argument("--adv_clip", type=float, default=OnlineRMPPOConfig.adv_clip)
     ap.add_argument(
         "--normalize_advantages",
@@ -175,6 +196,12 @@ def parse_args() -> OnlineRMPPOConfig:
         "--wandb_enabled",
         action=argparse.BooleanOptionalAction,
         default=OnlineRMPPOConfig.wandb_enabled,
+    )
+    ap.add_argument(
+        "--log_interval",
+        type=int,
+        default=OnlineRMPPOConfig.log_interval,
+        help="Log scalar training metrics to W&B every N steps (1 = every step).",
     )
     ap.add_argument("--sample_log_n", type=int, default=OnlineRMPPOConfig.sample_log_n)
     ap.add_argument("--sample_log_max_chars", type=int, default=OnlineRMPPOConfig.sample_log_max_chars)
@@ -411,6 +438,7 @@ def ppo_update(
     rollout: RolloutBatch,
     old_values: torch.Tensor,
     update_seed: int,
+    kl_coef: float,
 ) -> Dict[str, float]:
     policy_model.train()
     policy_model.config.use_cache = False
@@ -424,6 +452,7 @@ def ppo_update(
     total_kl = 0.0
     total_entropy = 0.0
     total_ratio_mean = 0.0
+    total_clipfrac = 0.0
     n_mb = 0
     accum = 0
     skipped_empty = 0
@@ -456,14 +485,16 @@ def ppo_update(
                 continue
 
             new_logp = compute_per_token_logprobs(policy_model, mb.input_ids, mb.attention_mask, enable_grad=True)
-            log_ratio_tok = new_logp - mb.old_logprobs
-            log_ratio_seq = _masked_mean_per_row(log_ratio_tok, mask)
-            ratio = torch.exp(log_ratio_seq)
-            ratio_clipped = torch.clamp(ratio, 1.0 - cfg.clip_eps, 1.0 + cfg.clip_eps)
 
-            surr1 = ratio * mb_adv
-            surr2 = ratio_clipped * mb_adv
-            pg_loss = -torch.min(surr1, surr2).mean()
+            log_ratio_tok = new_logp - mb.old_logprobs
+            log_ratio_tok = torch.clamp(log_ratio_tok, -20.0, 20.0)
+            ratio_tok = torch.exp(log_ratio_tok)
+            ratio_tok_clipped = torch.clamp(ratio_tok, 1.0 - cfg.clip_eps, 1.0 + cfg.clip_eps)
+            adv_tok = mb_adv.unsqueeze(-1)
+            surr1 = ratio_tok * adv_tok
+            surr2 = ratio_tok_clipped * adv_tok
+            surr = torch.min(surr1, surr2)
+            pg_loss = -masked_mean(surr, mask)
 
             values = _compute_sequence_values(
                 model=policy_model,
@@ -485,7 +516,7 @@ def ppo_update(
             kl = approx_kl_from_logprobs(new_logp, mb.ref_logprobs, mask)
             entropy = -masked_mean(new_logp, mask)
 
-            loss = pg_loss + cfg.vf_coef * vf_loss + cfg.kl_coef * kl - cfg.ent_coef * entropy
+            loss = pg_loss + cfg.vf_coef * vf_loss + float(kl_coef) * kl - cfg.ent_coef * entropy
             loss = loss / max(1, cfg.grad_accum_steps)
             if not torch.isfinite(loss):
                 skipped_nonfinite += 1
@@ -513,7 +544,9 @@ def ppo_update(
             total_vf_loss += float(vf_loss.detach().item())
             total_kl += float(kl.detach().item())
             total_entropy += float(entropy.detach().item())
-            total_ratio_mean += float(ratio.detach().mean().item())
+            total_ratio_mean += float(masked_mean(ratio_tok, mask).detach().item())
+            clipfrac_tok = (ratio_tok.detach() != ratio_tok_clipped.detach()).float()
+            total_clipfrac += float(masked_mean(clipfrac_tok, mask).detach().item())
             n_mb += 1
 
     if accum > 0 and (accum % max(1, cfg.grad_accum_steps)) != 0:
@@ -534,6 +567,7 @@ def ppo_update(
         "train/approximate_kl_divergence_policy_vs_reference_mean_over_minibatches": total_kl / denom,
         "train/policy_token_entropy_mean_over_minibatches": total_entropy / denom,
         "train/ppo_ratio_mean_over_minibatches": total_ratio_mean / denom,
+        "train/ppo_clipfrac_mean_over_minibatches": total_clipfrac / denom,
         "train/count_minibatches_skipped_because_completion_mask_had_no_tokens": float(skipped_empty),
         "train/count_update_attempts_skipped_due_to_nonfinite_loss_or_gradients": float(skipped_nonfinite),
         "train/gradient_global_norm_after_clipping_mean_over_optimizer_steps": total_grad_norm / max(1, opt_steps),
@@ -724,6 +758,7 @@ def main() -> None:
 
     start_time = time.time()
     base_lrs = [float(cfg.lr), float(cfg.value_lr)]
+    kl_coef = float(cfg.kl_coef)
     for step in range(1, cfg.steps + 1):
         maybe_update_warmup_lrs(optimizer, base_lrs, step - 1, cfg.warmup_steps)
         prompt_batch = _sample_prompt_batch(train_examples, cfg.batch_size, rng)
@@ -795,7 +830,15 @@ def main() -> None:
             rollout=batch,
             old_values=old_values,
             update_seed=step,
+            kl_coef=kl_coef,
         )
+        if cfg.adaptive_kl:
+            mean_kl = float(
+                train_metrics.get("train/approximate_kl_divergence_policy_vs_reference_mean_over_minibatches", 0.0)
+            )
+            horizon = float(max(1e-6, cfg.kl_horizon))
+            kl_coef = kl_coef * math.exp((mean_kl - float(cfg.target_kl)) / horizon)
+            kl_coef = float(min(max(kl_coef, float(cfg.kl_coef_min)), float(cfg.kl_coef_max)))
 
         completion_lengths = batch.completion_mask.sum(dim=1).float()
         adv, _ret = _build_advantages_and_returns(rewards, old_values, normalize=cfg.normalize_advantages)
@@ -812,11 +855,13 @@ def main() -> None:
             "rollout/completion_max_tokens": float(completion_lengths.max().item()),
             "rollout/count_completions": float(rewards.numel()),
             "train/learning_rate": float(optimizer.param_groups[0]["lr"]),
+            "train/kl_coef_effective": float(kl_coef),
             "time/seconds_since_start": float(time.time() - start_time),
             **train_metrics,
             **get_cuda_memory_metrics(prefix="train"),
         }
-        logger.log(log_metrics, step=step)
+        if (cfg.log_interval <= 1) or (step % cfg.log_interval == 0) or (step == cfg.steps):
+            logger.log(log_metrics, step=step)
 
         should_eval = (step % cfg.eval_interval == 0) or (step == cfg.steps)
         should_save = (step % cfg.save_interval == 0) or (step == cfg.steps)

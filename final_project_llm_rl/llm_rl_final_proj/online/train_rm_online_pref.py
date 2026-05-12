@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Sequence
 
-import torch
+import torch  # pyright: ignore[reportMissingImports]
 
 from llm_rl_final_proj.data.ultrafeedback import (
     GenerationExample,
@@ -108,6 +108,7 @@ class OnlinePreferenceConfig:
     wandb_project: str = "llm-rl-final-project"
     wandb_name: str = "rm_online_pref"
     wandb_enabled: bool = True
+    log_interval: int = 1
     sample_log_n: int = 8
     sample_log_max_chars: int = 2500
 
@@ -182,6 +183,12 @@ def parse_args() -> OnlinePreferenceConfig:
         "--wandb_enabled",
         action=argparse.BooleanOptionalAction,
         default=OnlinePreferenceConfig.wandb_enabled,
+    )
+    ap.add_argument(
+        "--log_interval",
+        type=int,
+        default=OnlinePreferenceConfig.log_interval,
+        help="Log scalar training metrics to W&B every N steps (1 = every step).",
     )
     ap.add_argument("--sample_log_n", type=int, default=OnlinePreferenceConfig.sample_log_n)
     ap.add_argument("--sample_log_max_chars", type=int, default=OnlinePreferenceConfig.sample_log_max_chars)
@@ -639,7 +646,8 @@ def _main_impl() -> None:
             **get_cuda_memory_metrics(prefix="train"),
             **update_metrics,
         }
-        logger.log(log_metrics, step=step)
+        if (cfg.log_interval <= 1) or (step % cfg.log_interval == 0) or (step == cfg.steps):
+            logger.log(log_metrics, step=step)
 
         should_eval = (cfg.eval_interval > 0 and step % cfg.eval_interval == 0) or (step == cfg.steps)
         should_save = (cfg.save_interval > 0 and step % cfg.save_interval == 0) or (step == cfg.steps)
